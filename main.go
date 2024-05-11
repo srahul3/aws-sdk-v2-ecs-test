@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	_ "embed"
-	"encoding/json"
 	"fmt"
 	"time"
 
@@ -20,14 +19,13 @@ type AppConfig struct {
 	Region            string `json:"region"`
 }
 
-//go:embed config.json
-var configJson []byte
-
 // runECSTask runs ECS task
 func runECSTask() error {
-	var appConfig AppConfig
-	if jerr := json.Unmarshal(configJson, &appConfig); jerr != nil {
-		return jerr
+	appConfig := AppConfig{
+		Cluster:           "devcluster2",
+		TaskDefinitionArn: "arn:aws:ecs:us-west-2:123456789012:task-definition/ecs-task:1",
+		SubnetID:          "subnet-1234567890abcdef0",
+		Region:            "us-west-2",
 	}
 
 	cfg, err := config.LoadDefaultConfig(context.TODO(), config.WithRegion(appConfig.Region))
