@@ -23,29 +23,47 @@ var subnets = []string{
 	"subnet-082ad242218f081d0", "subnet-043bd65c3571ef63b", "subnet-0bbf760006fd628d9",
 }
 
-type AppConfig struct {
+type ECSDriver struct {
 	Cluster           string `json:"cluster"`
 	TaskDefinitionArn string `json:"taskDefinitionArn"`
 	Region            string `json:"region"`
+	CWGroupArn        string `json:"cwGroupArn"`
+	CWGroupName       string `json:"cwGroupName"`
+	client            *ecs.Client
+	cwClient          *cloudwatchlogs.Client
+	runTaskIn         *ecs.RunTaskInput
+	taskID            string
 }
 
-// runECSTask runs ECS task
-func runECSTask() error {
-	appConfig := AppConfig{
-		Cluster:           "tfe-agent-ecs-cluster",
-		TaskDefinitionArn: "arn:aws:ecs:us-west-2:980777455695:task-definition/tfe-agent:7",
-		Region:            "us-west-2",
-	}
+func (a *ECSDriver) init() error {
+	// appConfig := ECSDriver{
+	// 	Cluster:           "tfe-agent-ecs-cluster",
+	// 	TaskDefinitionArn: "arn:aws:ecs:us-west-2:980777455695:task-definition/tfe-agent:7",
+	// 	Region:            "us-west-2",
+	// }
 
-	cfg, err := config.LoadDefaultConfig(context.TODO(), config.WithRegion(appConfig.Region))
+	cfg, err := config.LoadDefaultConfig(context.TODO(), config.WithRegion(a.Region))
 	if err != nil {
 		return err
 	}
 
-	client := ecs.NewFromConfig(cfg)
-	runTaskIn := &ecs.RunTaskInput{
-		TaskDefinition: aws.String(appConfig.TaskDefinitionArn),
-		Cluster:        aws.String(appConfig.Cluster),
+	a.client = ecs.NewFromConfig(cfg)
+	// _, err = client.DescribeClusters(context.TODO(), &ecs.DescribeClustersInput{
+	// 	Clusters: []string{a.Cluster},
+	// })
+	// if err != nil {
+	// 	return err
+	// }
+
+	// _, err = client.DescribeTaskDefinition(context.TODO(), &ecs.DescribeTaskDefinitionInput{
+	// 	TaskDefinition: aws.String(a.TaskDefinitionArn),
+	// })
+	// if err != nil {
+	// 	return err
+	// }
+	a.runTaskIn = &ecs.RunTaskInput{
+		TaskDefinition: aws.String(a.TaskDefinitionArn),
+		Cluster:        aws.String(a.Cluster),
 		NetworkConfiguration: &types.NetworkConfiguration{
 			AwsvpcConfiguration: &types.AwsVpcConfiguration{
 				Subnets: subnets,
@@ -57,14 +75,14 @@ func runECSTask() error {
 		LaunchType: types.LaunchTypeFargate,
 	}
 
-	// o, e := client.ListClusters(context.TODO(), &ecs.ListClustersInput{})
-	// if e != nil {
-	// 	return e
-	// }
-	// fmt.Println("Clusters:" + o.ClusterArns[0])
+	a.cwClient = cloudwatchlogs.NewFromConfig(cfg)
 
+	return nil
+}
+
+func (a *ECSDriver) runTask() error {
 	// run the task
-	runOut, rerr := client.RunTask(context.TODO(), runTaskIn)
+	runOut, rerr := a.client.RunTask(context.TODO(), a.runTaskIn)
 	if rerr != nil {
 		return rerr
 	}
@@ -72,21 +90,21 @@ func runECSTask() error {
 	taskArn := aws.ToString(runOut.Tasks[0].TaskArn)
 	fmt.Println("Task Created.")
 	fmt.Println("\tTaskARN: ", taskArn)
-	fmt.Printf("\taws ecs describe-tasks --cluster %s --tasks %s\n\n", appConfig.Cluster, taskArn)
 
 	// split the taskArn to get the log stream name
-	taskArnPartsLast := "tfe-agent/tfe-agent/" + strings.Split(taskArn, "/")[len(strings.Split(taskArn, "/"))-1]
-	fmt.Println("Log Stream Name: ", taskArnPartsLast)
+	a.taskID = "tfe-agent/tfe-agent/" + strings.Split(taskArn, "/")[len(strings.Split(taskArn, "/"))-1]
+	fmt.Println("\tCloudWatchGroup: ", a.CWGroupName)
+	fmt.Println("\tCloudWatchStream: ", a.taskID)
 
-	cwClient := cloudwatchlogs.NewFromConfig(cfg)
+	// start the log streaming
 	b := backoff.NewConstantBackOff(1 * time.Second)
-	backoff.Retry(func() error {
+	err := backoff.Retry(func() error {
 		request := &cloudwatchlogs.StartLiveTailInput{
-			LogGroupIdentifiers: []string{"arn:aws:logs:us-west-2:980777455695:log-group:demo-cw"},
-			LogStreamNames:      []string{taskArnPartsLast},
+			LogGroupIdentifiers: []string{a.CWGroupArn},
+			LogStreamNames:      []string{a.taskID},
 		}
 
-		response, err := cwClient.StartLiveTail(context.TODO(), request)
+		response, err := a.cwClient.StartLiveTail(context.TODO(), request)
 		// Handle pre-stream Exceptions
 		if err != nil {
 			log.Printf("Failed to start streaming: %v", err)
@@ -98,11 +116,15 @@ func runECSTask() error {
 		return nil
 	}, b)
 
+	if err != nil {
+		return err
+	}
+
 	// wait for the task to stop
-	waiter := ecs.NewTasksStoppedWaiter(client)
+	waiter := ecs.NewTasksStoppedWaiter(a.client)
 	waitParams := &ecs.DescribeTasksInput{
 		Tasks:   []string{taskArn},
-		Cluster: aws.String(appConfig.Cluster),
+		Cluster: aws.String(a.Cluster),
 	}
 	maxWaitTime := 5 * time.Minute
 
@@ -113,51 +135,30 @@ func runECSTask() error {
 
 	// marshal the output to pretty print
 	out, err := json.MarshalIndent(stdOut, "", "  ")
-	// out, err := json.Marshal(stdOut)
 	if err != nil {
-		panic(err)
+		return err
 	}
 
 	fmt.Println(string(out))
 
-	// if werr := waiter.Wait(context.TODO(), waitParams, maxWaitTime); werr != nil {
-	// 	return werr
-	// }
-
-	describeIn := &ecs.DescribeTasksInput{
-		Tasks:   []string{taskArn},
-		Cluster: aws.String(appConfig.Cluster),
-	}
-	stopOut, serr := client.DescribeTasks(context.TODO(), describeIn)
-	if serr != nil {
-		return serr
-	}
-
-	if stopOut.Tasks[0].StoppedReason != nil {
-		fmt.Println("Task Stopped with reason: ", *stopOut.Tasks[0].StoppedReason)
-	}
-
-	createdAt := *stopOut.Tasks[0].CreatedAt
-	stoppedAt := *stopOut.Tasks[0].StoppedAt
-
 	fmt.Println("Task Stopped.")
-	fmt.Println("\tTaskARN: ", aws.ToString(stopOut.Tasks[0].TaskArn))
-	fmt.Println("\tCreatedAt: ", createdAt)
+	fmt.Println("\tTaskARN: ", aws.ToString(stdOut.Tasks[0].TaskArn))
+	fmt.Println("\tCreatedAt: ", *stdOut.Tasks[0].CreatedAt)
+	fmt.Println("\tStartedAt: ", *stdOut.Tasks[0].StartedAt)
+	fmt.Println("\tStoppedAt: ", *stdOut.Tasks[0].StoppedAt)
+	fmt.Printf("\tTakenTimeToStart: %s", stdOut.Tasks[0].StartedAt.Sub(*stdOut.Tasks[0].CreatedAt))
 
-	fmt.Println("\tStoppedAt: ", stoppedAt)
+	return nil
+}
 
-	startedAt := *stopOut.Tasks[0].StartedAt
-	takenTime := startedAt.Sub(createdAt)
-	fmt.Println("\tStartedAt: ", startedAt)
-	fmt.Printf("\tTakenTimeToStart: %s", takenTime)
-
+func (a *ECSDriver) getLogs(taskArn string) error {
 	// printing the logs
 	logsIn := &cloudwatchlogs.GetLogEventsInput{
-		LogGroupName:  aws.String("demo-cw"),
-		LogStreamName: aws.String(taskArnPartsLast),
+		LogGroupName:  aws.String(a.CWGroupName),
+		LogStreamName: aws.String(a.taskID),
 	}
 	// cwClient := cloudwatchlogs.NewFromConfig(cfg)
-	logsOut, lerr := cwClient.GetLogEvents(context.TODO(), logsIn)
+	logsOut, lerr := a.cwClient.GetLogEvents(context.TODO(), logsIn)
 	if lerr != nil {
 		return lerr
 	}
@@ -168,8 +169,6 @@ func runECSTask() error {
 	for e := range logsOut.Events {
 		fmt.Println(*logsOut.Events[e].Message)
 	}
-	// logsOutStr, _ := json.Marshal(logsOut)
-	// fmt.Println(string(logsOutStr))
 
 	return nil
 }
@@ -200,7 +199,19 @@ func main() {
 		}
 	}
 
-	if err := runECSTask(); err != nil {
+	driver := ECSDriver{
+		Cluster:           "tfe-agent-ecs-cluster",
+		TaskDefinitionArn: "arn:aws:ecs:us-west-2:980777455695:task-definition/tfe-agent:7",
+		Region:            "us-west-2",
+		CWGroupArn:        "arn:aws:logs:us-west-2:980777455695:log-group:demo-cw",
+		CWGroupName:       "demo-cw",
+	}
+
+	if err := driver.init(); err != nil {
+		fmt.Println(err.Error())
+	}
+
+	if err := driver.runTask(); err != nil {
 		fmt.Println(err.Error())
 	}
 }
