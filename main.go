@@ -33,6 +33,7 @@ type ECSDriver struct {
 	cwClient          *cloudwatchlogs.Client
 	runTaskIn         *ecs.RunTaskInput
 	taskID            string
+	cwStream          string
 }
 
 func (a *ECSDriver) init() error {
@@ -92,16 +93,18 @@ func (a *ECSDriver) runTask() error {
 	fmt.Println("\tTaskARN: ", taskArn)
 
 	// split the taskArn to get the log stream name
-	a.taskID = "tfe-agent/tfe-agent/" + strings.Split(taskArn, "/")[len(strings.Split(taskArn, "/"))-1]
+	a.taskID = strings.Split(taskArn, "/")[len(strings.Split(taskArn, "/"))-1]
+	fmt.Println("\tTaskID: ", a.taskID)
+	a.cwStream = "tfe-agent/tfe-agent/" + a.taskID
 	fmt.Println("\tCloudWatchGroup: ", a.CWGroupName)
-	fmt.Println("\tCloudWatchStream: ", a.taskID)
+	fmt.Println("\tCloudWatchStream: ", a.cwStream)
 
 	// start the log streaming
 	b := backoff.NewConstantBackOff(1 * time.Second)
 	err := backoff.Retry(func() error {
 		request := &cloudwatchlogs.StartLiveTailInput{
 			LogGroupIdentifiers: []string{a.CWGroupArn},
-			LogStreamNames:      []string{a.taskID},
+			LogStreamNames:      []string{a.cwStream},
 		}
 
 		response, err := a.cwClient.StartLiveTail(context.TODO(), request)
@@ -155,7 +158,7 @@ func (a *ECSDriver) getLogs(taskArn string) error {
 	// printing the logs
 	logsIn := &cloudwatchlogs.GetLogEventsInput{
 		LogGroupName:  aws.String(a.CWGroupName),
-		LogStreamName: aws.String(a.taskID),
+		LogStreamName: aws.String(a.cwStream),
 	}
 	// cwClient := cloudwatchlogs.NewFromConfig(cfg)
 	logsOut, lerr := a.cwClient.GetLogEvents(context.TODO(), logsIn)
