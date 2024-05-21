@@ -16,14 +16,17 @@ import (
 	typecw "github.com/aws/aws-sdk-go-v2/service/cloudwatchlogs/types"
 	"github.com/aws/aws-sdk-go-v2/service/ecs"
 	"github.com/aws/aws-sdk-go-v2/service/ecs/types"
+	"github.com/cenkalti/backoff/v4"
 )
+
+var subnets = []string{
+	"subnet-082ad242218f081d0", "subnet-043bd65c3571ef63b", "subnet-0bbf760006fd628d9",
+}
 
 type AppConfig struct {
 	Cluster           string `json:"cluster"`
 	TaskDefinitionArn string `json:"taskDefinitionArn"`
-	// SubnetID1         string `json:"subnetId"`
-	// SubnetID2         string `json:"subnetId"`
-	Region string `json:"region"`
+	Region            string `json:"region"`
 }
 
 // runECSTask runs ECS task
@@ -31,9 +34,7 @@ func runECSTask() error {
 	appConfig := AppConfig{
 		Cluster:           "tfe-agent-ecs-cluster",
 		TaskDefinitionArn: "arn:aws:ecs:us-west-2:980777455695:task-definition/tfe-agent:7",
-		// SubnetID1:         "subnet-05bc5e7437519ece3",
-		// SubnetID2:         "subnet-0d562d65058e8d2f5",
-		Region: "us-west-2",
+		Region:            "us-west-2",
 	}
 
 	cfg, err := config.LoadDefaultConfig(context.TODO(), config.WithRegion(appConfig.Region))
@@ -41,24 +42,13 @@ func runECSTask() error {
 		return err
 	}
 
-	// cfg.Credentials = aws.CredentialsProviderFunc(func(ctx context.Context) (aws.Credentials, error) {
-	// 	return aws.Credentials{
-	// 		AccessKeyID:     os.Getenv("AWS_ACCESS_KEY_ID"),
-	// 		SecretAccessKey: os.Getenv("AWS_SECRET_ACCESS_KEY"),
-	// 		SessionToken:    os.Getenv("AWS_SESSION_TOKEN"),
-	// 		Source:          "ECS Task Runner",
-	// 	}, nil
-	// })
-
 	client := ecs.NewFromConfig(cfg)
 	runTaskIn := &ecs.RunTaskInput{
 		TaskDefinition: aws.String(appConfig.TaskDefinitionArn),
 		Cluster:        aws.String(appConfig.Cluster),
 		NetworkConfiguration: &types.NetworkConfiguration{
 			AwsvpcConfiguration: &types.AwsVpcConfiguration{
-				Subnets: []string{
-					"subnet-082ad242218f081d0", "subnet-043bd65c3571ef63b", "subnet-0bbf760006fd628d9",
-				},
+				Subnets: subnets,
 				// needs to be enabled for Fargate
 				AssignPublicIp: types.AssignPublicIpEnabled,
 			},
@@ -88,23 +78,25 @@ func runECSTask() error {
 	taskArnPartsLast := "tfe-agent/tfe-agent/" + strings.Split(taskArn, "/")[len(strings.Split(taskArn, "/"))-1]
 	fmt.Println("Log Stream Name: ", taskArnPartsLast)
 
-	// // get log stream
-	// cwClient := cloudwatchlogs.NewFromConfig(cfg)
-	// request := &cloudwatchlogs.StartLiveTailInput{
-	// 	LogGroupIdentifiers: []string{"arn:aws:logs:us-west-2:980777455695:log-group:demo-cw"},
-	// 	LogStreamNames:      []string{taskArnPartsLast},
-	// 	// LogEventFilterPattern: logEventFilterPattern,
-	// }
+	cwClient := cloudwatchlogs.NewFromConfig(cfg)
+	b := backoff.NewConstantBackOff(1 * time.Second)
+	backoff.Retry(func() error {
+		request := &cloudwatchlogs.StartLiveTailInput{
+			LogGroupIdentifiers: []string{"arn:aws:logs:us-west-2:980777455695:log-group:demo-cw"},
+			LogStreamNames:      []string{taskArnPartsLast},
+		}
 
-	// response, err := cwClient.StartLiveTail(context.TODO(), request)
-	// // Handle pre-stream Exceptions
-	// if err != nil {
-	// 	log.Fatalf("Failed to start streaming: %v", err)
-	// }
+		response, err := cwClient.StartLiveTail(context.TODO(), request)
+		// Handle pre-stream Exceptions
+		if err != nil {
+			log.Printf("Failed to start streaming: %v", err)
+			return err
+		}
 
-	// // Start a Goroutine to handle events over stream
-	// stream := response.GetStream()
-	// go handleEventStreamAsync(stream)
+		stream := response.GetStream()
+		go handleEventStreamAsync(stream)
+		return nil
+	}, b)
 
 	// wait for the task to stop
 	waiter := ecs.NewTasksStoppedWaiter(client)
@@ -114,13 +106,14 @@ func runECSTask() error {
 	}
 	maxWaitTime := 5 * time.Minute
 
-	// client.WaitForOutput(waiter, waitParams, maxWaitTime)
-
 	stdOut, err := waiter.WaitForOutput(context.TODO(), waitParams, maxWaitTime)
 	if err != nil {
 		return err
 	}
-	out, err := json.Marshal(stdOut)
+
+	// marshal the output to pretty print
+	out, err := json.MarshalIndent(stdOut, "", "  ")
+	// out, err := json.Marshal(stdOut)
 	if err != nil {
 		panic(err)
 	}
@@ -163,12 +156,14 @@ func runECSTask() error {
 		LogGroupName:  aws.String("demo-cw"),
 		LogStreamName: aws.String(taskArnPartsLast),
 	}
-	cwClient := cloudwatchlogs.NewFromConfig(cfg)
+	// cwClient := cloudwatchlogs.NewFromConfig(cfg)
 	logsOut, lerr := cwClient.GetLogEvents(context.TODO(), logsIn)
 	if lerr != nil {
 		return lerr
 	}
 
+	fmt.Println("")
+	fmt.Println("CW Logs:--------------------------------------------------")
 	// print the logs to the console
 	for e := range logsOut.Events {
 		fmt.Println(*logsOut.Events[e].Message)
