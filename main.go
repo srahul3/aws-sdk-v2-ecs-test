@@ -37,31 +37,15 @@ type ECSDriver struct {
 }
 
 func (a *ECSDriver) init() error {
-	// appConfig := ECSDriver{
-	// 	Cluster:           "tfe-agent-ecs-cluster",
-	// 	TaskDefinitionArn: "arn:aws:ecs:us-west-2:980777455695:task-definition/tfe-agent:7",
-	// 	Region:            "us-west-2",
-	// }
-
 	cfg, err := config.LoadDefaultConfig(context.TODO(), config.WithRegion(a.Region))
 	if err != nil {
 		return err
 	}
 
+	// create the ECS client
 	a.client = ecs.NewFromConfig(cfg)
-	// _, err = client.DescribeClusters(context.TODO(), &ecs.DescribeClustersInput{
-	// 	Clusters: []string{a.Cluster},
-	// })
-	// if err != nil {
-	// 	return err
-	// }
 
-	// _, err = client.DescribeTaskDefinition(context.TODO(), &ecs.DescribeTaskDefinitionInput{
-	// 	TaskDefinition: aws.String(a.TaskDefinitionArn),
-	// })
-	// if err != nil {
-	// 	return err
-	// }
+	// create the runTask input
 	a.runTaskIn = &ecs.RunTaskInput{
 		TaskDefinition: aws.String(a.TaskDefinitionArn),
 		Cluster:        aws.String(a.Cluster),
@@ -76,6 +60,7 @@ func (a *ECSDriver) init() error {
 		LaunchType: types.LaunchTypeFargate,
 	}
 
+	// create the CloudWatchLogs client
 	a.cwClient = cloudwatchlogs.NewFromConfig(cfg)
 
 	return nil
